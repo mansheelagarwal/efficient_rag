@@ -1,6 +1,7 @@
 ## built-in
 import argparse,json,os
 import time
+
 ## third party
 from transformers import (
     MistralForCausalLM,
@@ -358,32 +359,63 @@ def prepare_prompts(
 def load_dataset(data,use_rag,args):
     
     dev_data = None
-    test_path = f"data/eval/{data}/test.jsonl"
     test_data = None
-    if os.path.isfile(test_path):
-        test_data = get_jsonl(test_path)
-
-    if use_rag:
-
-        test_retrieval_path = os.path.join(f"data/eval/{data}/retrieval/{args.retrieval_prefix}","test.jsonl")
-        test_retrieval = get_jsonl(test_retrieval_path)
-        assert len(test_retrieval) == len(test_data)
-        for idx in range(len(test_data)):
-            test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
+    
+    # *** USE TRIVIAQA CONTEXT *** #
+    if data.lower() == "triviaqa_topk":
         
-        if args.tf_idf_topk > 0:
-            assert args.use_rag
-            documents = [x['background'][0] for x in test_data]
-            keywords = keyword_extraction_with_tfidf(documents,topk=args.tf_idf_topk)
-            for idx in range(len(test_data)):
-                test_data[idx]['background'] = [keywords[idx]]
+        # load triviaqa from hf
+        dataset = datasets.load_dataset("mandarjoshi/trivia_qa", 'rc', split="validation")
         
-        if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+        test_data = []
+        for sample in dataset:
+            
+            question = sample['question']
+            
+            answer = ""
+            if "answer" in sample and isinstance(sample["answer"], dict):
+                answer = sample["answer"].get("value", "")
+                
+            search_results = sample.get("search_results", {})
+            search_contexts = search_results.get("search_context", [])
+            
+            if not isinstance(search_contexts, list):
+                search_contexts = [search_contexts]
+                
+            background = [ctx for ctx in search_contexts if isinstance(ctx, str) and ctx.strip() != ""]
+            
+            test_data.append({
+                "question": question,
+                "answer": answer,
+                "background": background
+            })
+
+    else:
+        
+        # fallback: load from JSONL file as before.
+        test_path = f"data/eval/{data}/test.jsonl"
+        if os.path.isfile(test_path):
+            test_data = get_jsonl(test_path)
+
+        if use_rag:
+            test_retrieval_path = os.path.join(f"data/eval/{data}/retrieval/{args.retrieval_prefix}", "test.jsonl")
+            test_retrieval = get_jsonl(test_retrieval_path)
+            assert len(test_retrieval) == len(test_data)
             for idx in range(len(test_data)):
-                test_data[idx]['background'] = ["passage: " + x for x in test_data[idx]['background']]
+                test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
 
+            if args.tf_idf_topk > 0:
+                assert args.use_rag
+                documents = [x['background'][0] for x in test_data]
+                keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
+                for idx in range(len(test_data)):
+                    test_data[idx]['background'] = [keywords[idx]]
 
-    return dev_data,test_data
+            if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+                for idx in range(len(test_data)):
+                    test_data[idx]['background'] = ["passage: " + x for x in test_data[idx]['background']]
+
+    return dev_data, test_data
 
 if __name__ == "__main__":
 
@@ -416,7 +448,6 @@ if __name__ == "__main__":
         retriever_hidden_size = retriever.get_embed_dim()
         retriever.eval()
         retriever = retriever.to(device)
-
 
     ## prepare prompt
     dev_data,test_data = load_dataset(

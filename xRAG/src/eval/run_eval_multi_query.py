@@ -14,6 +14,7 @@ import torch
 import datasets
 from tqdm import tqdm
 import pandas as pd
+import re
 
 ## own
 from src.model import (
@@ -161,6 +162,38 @@ PROMPT_TEMPLATES = {
     "open_qa":QA_PROMPT,
     'fact_checking':FECT_CHECKING_PROPMT,
 }
+
+# *** DISTRACTOR CONTEXT GENERATOR *** #
+@torch.no_grad()
+def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
+
+    prompt = (
+        f"Provide {k} misleading evidence snippets for the question: \"{original_query}\". "
+        "Each snippet should be a short, plain-text Wikipedia-like excerpt that does NOT contain the correct answer. "
+        "Do not include any numbering, bullet points, or special tokens."
+    )
+    
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(llm.device)
+    output = llm.generate(**inputs, max_new_tokens=200, do_sample=True, temperature=0.9)
+    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    
+    # split into lines and remove empty lines
+    lines = [line.strip() for line in generated_text.split("\n") if line.strip()]
+    
+    # post processing
+    cleaned_lines = []
+    for line in lines:
+        if line.startswith("Provide"):
+            continue
+        line = re.sub(r"^Evidence Snippet\s*\d+[:\-]?\s*", "", line)
+        line = re.sub(r"^Snippet\s*\d+[:\-]?\s*", "", line)
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        cleaned_lines.append(line)
+    non_empty = [line for line in cleaned_lines if line]
+    
+    # Return exactly k snippets.
+    return non_empty[:k]
 
 # *** GENERATE SYNTHETIC QUERIES *** #
 @torch.no_grad()
@@ -368,7 +401,8 @@ def load_dataset(data,use_rag,args):
         dataset = datasets.load_dataset("mandarjoshi/trivia_qa", 'rc', split="validation")
         
         test_data = []
-        for sample in dataset:
+        print("Loading TriviaQA dataset...")
+        for sample in tqdm(dataset):
             
             question = sample['question']
             
@@ -421,7 +455,34 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    ## load tokenizer
+    ## prepare dataset
+    dev_data, test_data = load_dataset(
+        args.data,
+        args.use_rag,
+        args,
+    )
+        
+    # *** ADD DISTRACTOR CHOICES *** #
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    temp_llm = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-7b-chat-hf",
+        torch_dtype=torch.float16,
+    ).to(device)
+    temp_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+    temp_llm.eval()
+
+    if args.max_test_samples is not None:
+        test_data = test_data[:args.max_test_samples]
+        
+    for sample in tqdm(test_data):
+        original_query = sample["question"]
+        distractors = generate_distractor_contexts(temp_llm, temp_tokenizer, original_query, k=5)
+        sample["background"].extend(distractors)
+        
+    del temp_llm, temp_tokenizer
+    torch.cuda.empty_cache()
+
+    ## load retriever and retriever_tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         padding_side = 'left',
@@ -434,8 +495,7 @@ if __name__ == "__main__":
         tokenizer.pad_token_id = tokenizer.unk_token_id
     elif tokenizer.eos_token:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    ## load retriever and retriever_tokenizer
+        
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     retrieval_embed_length = 0
     retriever,retriever_tokenizer = None,None
@@ -448,17 +508,8 @@ if __name__ == "__main__":
         retriever_hidden_size = retriever.get_embed_dim()
         retriever.eval()
         retriever = retriever.to(device)
-
-    ## prepare prompt
-    dev_data,test_data = load_dataset(
-        args.data,
-        args.use_rag,
-        args,
-    )
-
-    if args.max_test_samples is not None:
-        test_data = test_data[:args.max_test_samples]
-
+    
+    ## prepare prompts
     prompts,backgrounds = prepare_prompts(
         dev_data = dev_data,
         test_data = test_data,
@@ -499,7 +550,6 @@ if __name__ == "__main__":
     avg_prompt_length = tokenizer(prompts,return_length=True).length
     avg_prompt_length = sum(avg_prompt_length)/len(avg_prompt_length)
     
-
     ## load llm
     config = AutoConfig.from_pretrained(args.model_name_or_path)
     MODEL_CLASS = eval(config.architectures[0])
@@ -509,9 +559,8 @@ if __name__ == "__main__":
         low_cpu_mem_usage = True,
         device_map='auto',
     )
-    
     model.eval()
-    # model = model.to(device)
+    
     if retriever is not None:
         assert XRAG_TOKEN in tokenizer.get_vocab() 
         model.set_xrag_token_id(tokenizer.convert_tokens_to_ids(XRAG_TOKEN))

@@ -10,10 +10,11 @@ from transformers import (
     AutoConfig,
     MixtralForCausalLM,
 )
+from sklearn.metrics.pairwise import cosine_similarity
 import torch
 import datasets
 from tqdm import tqdm
-import pandas as pd
+import numpy as np
 import re
 
 ## own
@@ -137,6 +138,13 @@ def parse_args():
         help="If set, generate distractor choices and save to a JSONL file; otherwise, load the JSONL file."
     )
     
+    # ** STORE DISTRACTOR CONTEXTS ** #
+    parser.add_argument(
+        "--ensemble_rerank",
+        action="store_true",
+        help="If set, generate synthetic queries, ensemble rerank distractor choices, and save to triviaqa_syn_ensemble.jsonl"
+    )
+    
     args = parser.parse_args()
 
     ## post-process
@@ -170,6 +178,61 @@ PROMPT_TEMPLATES = {
     "open_qa":QA_PROMPT,
     'fact_checking':FECT_CHECKING_PROPMT,
 }
+
+# ** GENERATE EMBEDDING ** #
+def get_text_embedding(text, model, tokenizer, max_length=128):
+
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=max_length).to(model.device)
+    with torch.no_grad():
+        embeds = get_retrieval_embeds(
+            model=model,
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask']
+        )
+        
+    # convert it from BFloat16 to float32 for NumPy compatibility.
+    emb = embeds[0].cpu().to(torch.float32).numpy()
+    norm = np.linalg.norm(emb)
+    if norm > 0:
+        emb = emb / norm
+    return emb
+
+
+# ** RE-RANK DISTRACTORS ** #
+@torch.no_grad()
+def ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer, max_length=128):
+    updated_test_data = []
+    for sample in tqdm(test_data, desc="Ensemble re-ranking distractors"):
+
+        synthetic_queries = sample.get("synthetic_queries", [])
+        if sample["query"] not in synthetic_queries:
+            synthetic_queries.append(sample["query"])
+        
+        distractors = sample.get("background", [])
+
+        synthetic_embeddings = []
+        for q in synthetic_queries:
+            emb = get_text_embedding(q, retriever, retriever_tokenizer, max_length=max_length)
+            synthetic_embeddings.append(emb)
+        
+        distractor_embeddings = []
+        for d in distractors:
+            emb = get_text_embedding(d, retriever, retriever_tokenizer, max_length=max_length)
+            distractor_embeddings.append(emb)
+        
+        # ensemble voting: For each synthetic query, choose the distractor with the highest cosine similarity.
+        votes = {}
+        for syn_emb in synthetic_embeddings:
+            sims = cosine_similarity([syn_emb], distractor_embeddings)[0]
+            best_idx = sims.argmax()
+            best_distractor = distractors[best_idx]
+            votes[best_distractor] = votes.get(best_distractor, 0) + 1
+        
+        # select the distractor with the highest vote.
+        final_distractor = max(votes.items(), key=lambda x: x[1])[0]
+        sample["background"] = [final_distractor]
+        updated_test_data.append(sample)
+    return updated_test_data
 
 # *** DISTRACTOR CONTEXT GENERATOR *** #
 @torch.no_grad()
@@ -218,15 +281,40 @@ def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
 def generate_synthetic_queries(llm, tokenizer, original_query, k=5):
 
     synthetic_queries = []
-    prompt_template = "Generate {} variations of this question while preserving the intent:\n\nQuestion: {}\n\nVariations:".format(k, original_query)
+    prompt = (
+        f"Generate {k} variations of this question while preserving the intent: \"{original_query}\". "
+        "Each new question should be around the same length as the original question. "
+        "Do not include numbering, bullet points, extra characters, headers, or any extra labels. "
+        "Do not include numbered lists or any type of ordered lists. "
+    )
     
-    inputs = tokenizer(prompt_template, return_tensors="pt", padding=True).to(llm.device)
-    output = llm.generate(**inputs, max_new_tokens=100, do_sample=True, temperature=0.7) # NOTE: temperature can change intent
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(llm.device)
+    output = llm.generate(**inputs, max_new_tokens=200) # NOTE: temperature can change intent
     
     generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
     synthetic_queries = [q.strip() for q in generated_text.split("\n") if q.strip()]
     
-    return synthetic_queries[:k]
+    # post processing
+    cleaned_lines = []
+    for line in synthetic_queries:
+        if line.startswith("Generate"):
+            continue
+        if line.startswith("Here"):
+            continue
+        if line.startswith("Snippet"):
+            continue
+        if line.startswith("Example"):
+            continue
+        if line.startswith("Question"):
+            continue
+        line = re.sub(r"^Generate\s*\d+[:\-]?\s*", "", line)
+        line = re.sub(r"^Context\s*\d+[:\-]?\s*", "", line)
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        cleaned_lines.append(line)
+    non_empty = [line for line in cleaned_lines if line]
+
+    return non_empty[:k]
 
 def get_start_prompt(task_type,use_rag,sample=None):
     if task_type == 'open_qa':
@@ -407,7 +495,7 @@ def prepare_prompts(
     return prompts,backgrounds
 
 
-def load_dataset(data,use_rag,args):
+def load_dataset(data,use_rag,args,use_distractors=False):
     
     dev_data = None
     test_data = None
@@ -445,27 +533,57 @@ def load_dataset(data,use_rag,args):
     else:
         
         # fallback: load from JSONL file as before.
-        test_path = f"data/eval/{data}/test.jsonl"
-        if os.path.isfile(test_path):
-            test_data = get_jsonl(test_path)
+        if use_distractors:
+            test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/triviaqa_syn.jsonl"
+            
+            if os.path.isfile(test_retrieval_path):
+                test_data = get_jsonl(test_retrieval_path)
 
-        if use_rag:
-            test_retrieval_path = os.path.join(f"data/eval/{data}/retrieval/{args.retrieval_prefix}", "test.jsonl")
-            test_retrieval = get_jsonl(test_retrieval_path)
-            assert len(test_retrieval) == len(test_data)
-            for idx in range(len(test_data)):
-                test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
+            if use_rag:
+                test_retrieval = get_jsonl(test_retrieval_path)
+                assert len(test_retrieval) == len(test_data), "Mismatch in retrieval and test data length"
 
-            if args.tf_idf_topk > 0:
-                assert args.use_rag
-                documents = [x['background'][0] for x in test_data]
-                keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
+                # Include all distractors as background context
                 for idx in range(len(test_data)):
-                    test_data[idx]['background'] = [keywords[idx]]
+                    test_data[idx]['background'] = [entry['text'] for entry in test_retrieval[idx]['topk']]
 
-            if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+                if args.tf_idf_topk > 0:
+                    assert args.use_rag, "TF-IDF filtering requires RAG mode"
+                    
+                    # Extract documents for TF-IDF keyword extraction
+                    documents = [" ".join(x['background']) for x in test_data]  
+                    keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
+                    
+                    for idx in range(len(test_data)):
+                        test_data[idx]['background'] = [keywords[idx]]
+
+                if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+                    for idx in range(len(test_data)):
+                        test_data[idx]['background'] = ["passage: " + text for text in test_data[idx]['background']]
+        
+        else:
+            test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/test.jsonl"
+            
+            if os.path.isfile(test_retrieval_path):
+                test_data = get_jsonl(test_retrieval_path)
+
+            if use_rag:
+                
+                test_retrieval = get_jsonl(test_retrieval_path)
+                assert len(test_retrieval) == len(test_data)
                 for idx in range(len(test_data)):
-                    test_data[idx]['background'] = ["passage: " + x for x in test_data[idx]['background']]
+                    test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
+
+                if args.tf_idf_topk > 0:
+                    assert args.use_rag
+                    documents = [x['background'][0] for x in test_data]
+                    keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
+                    for idx in range(len(test_data)):
+                        test_data[idx]['background'] = [keywords[idx]]
+
+                if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+                    for idx in range(len(test_data)):
+                        test_data[idx]['background'] = ["passage: " + x for x in test_data[idx]['background']]
 
     return dev_data, test_data
 
@@ -499,10 +617,20 @@ if __name__ == "__main__":
         with open(output_file, "w", encoding="utf-8") as f_out:
             for sample in tqdm(test_data, desc="Generating distractor JSONL"):
                 query = sample["question"]
+                orig_background = sample.get("background", [])
                 distractor_snippets = generate_distractor_contexts(temp_llm, temp_tokenizer, query, k=5)
-
+                
                 topk_list = []
-                for i, snippet in enumerate(distractor_snippets):
+                for bg in orig_background:
+                    topk_item = {
+                        "pid": None,
+                        "prob": None,
+                        "rank": None,
+                        "score": None,
+                        "text": bg
+                    }
+                    topk_list.append(topk_item)
+                for snippet in distractor_snippets:
                     topk_item = {
                         "pid": None,
                         "prob": None,
@@ -514,16 +642,72 @@ if __name__ == "__main__":
                 output_obj = {"query": query, "topk": topk_list}
                 f_out.write(json.dumps(output_obj) + "\n")
         print(f"Distractor JSONL saved to {output_file}")
-        exit(0) # leave python script
+        exit(0)  # leave python script
+    
+    # ** LOAD MODEL FOR SYNTHETIC QUERY GENERATION ** #
+    if args.ensemble_rerank:
+        # load dataset with distractor choices
+        dev_data, test_data = load_dataset(
+            args.data,
+            args.use_rag,
+            args,
+            use_distractors=True
+        )
+        if args.max_test_samples is not None:
+            test_data = test_data[:args.max_test_samples]
         
-    ## prepare dataset
+        # load model to generate synthetic queries
+        syn_llm = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-2-7b-chat-hf",
+            torch_dtype=torch.float16,
+            device_map='auto',
+        )
+        syn_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+        syn_llm.eval()
+        for sample in tqdm(test_data, desc="Generating synthetic queries"):
+            original_query = sample["query"]
+            synthetic_queries = generate_synthetic_queries(syn_llm, syn_tokenizer, original_query, k=args.k_samples)
+            sample["synthetic_queries"] = synthetic_queries
+        del syn_llm, syn_tokenizer
+        torch.cuda.empty_cache()
+        
+        # load retriever for ensemble reranking
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        retrieval_embed_length = 0
+        retriever, retriever_tokenizer = None, None
+        if args.retriever_name_or_path is not None:
+            if args.retriever_name_or_path.lower() == 'salesforce/sfr-embedding-mistral':
+                retriever = SFR.from_pretrained(args.retriever_name_or_path, torch_dtype=torch.bfloat16)
+                retriever_tokenizer = AutoTokenizer.from_pretrained(args.retriever_name_or_path)
+            retrieval_embed_length = retriever.get_embed_length()
+            retriever_hidden_size = retriever.get_embed_dim()
+            retriever.eval()
+            retriever = retriever.to(device)
+        
+        # (This function uses the precomputed sample["synthetic_queries"] and the distractor choices in sample["background"])
+        test_data = ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer)
+        
+        # save the ensemble JSONL file
+        ensemble_output_file = os.path.join(args.save_dir, f"triviaqa_syn_ensemble_{args.k_samples}.jsonl")
+        with open(ensemble_output_file, "w", encoding="utf-8") as f_out:
+            for sample in tqdm(test_data, desc="Saving ensemble JSONL"):
+                output_obj = {
+                    "query": sample["query"],
+                    "synthetic_queries": sample.get("synthetic_queries", []),
+                    "top1": sample["background"][0] if sample.get("background") else ""
+                }
+                f_out.write(json.dumps(output_obj) + "\n")
+        print(f"Ensemble JSONL saved to {ensemble_output_file}")
+        exit(0)
+        
+    ## load dataset
     dev_data, test_data = load_dataset(
         args.data,
         args.use_rag,
         args,
     )
-
-    ## load retriever and retriever_tokenizer
+    
+    ## prepare prompts
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         padding_side = 'left',
@@ -536,21 +720,6 @@ if __name__ == "__main__":
         tokenizer.pad_token_id = tokenizer.unk_token_id
     elif tokenizer.eos_token:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    retrieval_embed_length = 0
-    retriever,retriever_tokenizer = None,None
-    if args.retriever_name_or_path is not None:
-    
-        if args.retriever_name_or_path.lower() == 'salesforce/sfr-embedding-mistral':
-            retriever = SFR.from_pretrained(args.retriever_name_or_path,torch_dtype = torch.bfloat16)
-            retriever_tokenizer = AutoTokenizer.from_pretrained(args.retriever_name_or_path)
-        retrieval_embed_length = retriever.get_embed_length()
-        retriever_hidden_size = retriever.get_embed_dim()
-        retriever.eval()
-        retriever = retriever.to(device)
-    
-    ## prepare prompts
     prompts,backgrounds = prepare_prompts(
         dev_data = dev_data,
         test_data = test_data,

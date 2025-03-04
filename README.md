@@ -25,5 +25,25 @@ python run_eval_multi_query.py \
     --model_name_or_path Hannibal046/xrag-7b \
     --use_rag \
     --create_distractors \
-    --save_dir xRAG/data/eval/triviaqa/retrieval/syn
+    --save_dir ../../data/eval/triviaqa/retrieval/colbertv2
+```
+
+You can optionally use the --max_test_samples argument for debugging.
+
+## 2. Generate Synthetic Queries and Ensemble Score
+
+After generating your distractor choices, you can now generate `k` number of synthetic queries. Each synthetic query can now choose their own top 1 document. Afterwards, an ensemble scoring is done to select the overall top 1 document.
+
+To do this run:
+
+```
+cd xRAG/src/eval
+python run_eval_multi_query.py \
+    --data triviaqa \
+    --model_name_or_path Hannibal046/xrag-7b \
+    --use_rag \
+    --k_samples 5 \
+    --retriever_name_or_path Salesforce/SFR-Embedding-Mistral \
+    --ensemble_rerank \
+    --save_dir ../../data/eval/triviaqa/retrieval/colbertv2
 ```

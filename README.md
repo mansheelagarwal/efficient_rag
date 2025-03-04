@@ -47,3 +47,18 @@ python run_eval_multi_query.py \
     --ensemble_rerank \
     --save_dir ../../data/eval/triviaqa/retrieval/colbertv2
 ```
+
+## 3. Evaluate Approach
+
+```
+cd xRAG/src/eval
+python run_eval_multi_query.py \
+    --data triviaqa \
+    --model_name_or_path Hannibal046/xrag-7b \
+    --use_rag \
+    --k_samples 5 \
+    --retriever_name_or_path Salesforce/SFR-Embedding-Mistral \
+    --save_dir ../../data/eval/triviaqa/retrieval/colbertv2
+```
+
+If you defined `--max_test_samples` from step 1, please define it here as well.

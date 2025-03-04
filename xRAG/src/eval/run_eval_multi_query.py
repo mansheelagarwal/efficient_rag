@@ -232,6 +232,7 @@ def ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer, max_l
         final_distractor = max(votes.items(), key=lambda x: x[1])[0]
         sample["background"] = [final_distractor]
         updated_test_data.append(sample)
+        
     return updated_test_data
 
 # *** DISTRACTOR CONTEXT GENERATOR *** #
@@ -495,7 +496,7 @@ def prepare_prompts(
     return prompts,backgrounds
 
 
-def load_dataset(data,use_rag,args,use_distractors=False):
+def load_dataset(data,use_rag,args,use_distractors=False,k_samples=0,max_samples=None):
     
     dev_data = None
     test_data = None
@@ -562,17 +563,30 @@ def load_dataset(data,use_rag,args,use_distractors=False):
                         test_data[idx]['background'] = ["passage: " + text for text in test_data[idx]['background']]
         
         else:
-            test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/test.jsonl"
             
-            if os.path.isfile(test_retrieval_path):
-                test_data = get_jsonl(test_retrieval_path)
+            test_path = f"../../data/eval/{data}/test.jsonl"
+            if k_samples > 0:
+                test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/triviaqa_syn_ensemble_{k_samples}.jsonl"
+            else:
+                test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/test.jsonl"
+            
+            if os.path.isfile(test_path):
+                test_data = get_jsonl(test_path)
 
             if use_rag:
                 
                 test_retrieval = get_jsonl(test_retrieval_path)
+                
+                if max_samples is not None:
+                    test_data = test_data[:max_samples]
+                    test_retrieval = test_retrieval[:max_samples]
                 assert len(test_retrieval) == len(test_data)
+                
                 for idx in range(len(test_data)):
-                    test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
+                    if k_samples > 0:
+                        test_data[idx]['background'] = [test_retrieval[idx]['topk'] for rank in args.retrieval_topk]
+                    else:
+                        test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
 
                 if args.tf_idf_topk > 0:
                     assert args.use_rag
@@ -694,7 +708,7 @@ if __name__ == "__main__":
                 output_obj = {
                     "query": sample["query"],
                     "synthetic_queries": sample.get("synthetic_queries", []),
-                    "top1": sample["background"][0] if sample.get("background") else ""
+                    "topk": sample["background"][0] if sample.get("background") else ""
                 }
                 f_out.write(json.dumps(output_obj) + "\n")
         print(f"Ensemble JSONL saved to {ensemble_output_file}")
@@ -705,7 +719,22 @@ if __name__ == "__main__":
         args.data,
         args.use_rag,
         args,
+        k_samples=args.k_samples,
+        max_samples=args.max_test_samples,
     )
+    
+    ## load retriever for ensemble reranking
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    retrieval_embed_length = 0
+    retriever, retriever_tokenizer = None, None
+    if args.retriever_name_or_path is not None:
+        if args.retriever_name_or_path.lower() == 'salesforce/sfr-embedding-mistral':
+            retriever = SFR.from_pretrained(args.retriever_name_or_path, torch_dtype=torch.bfloat16)
+            retriever_tokenizer = AutoTokenizer.from_pretrained(args.retriever_name_or_path)
+        retrieval_embed_length = retriever.get_embed_length()
+        retriever_hidden_size = retriever.get_embed_dim()
+        retriever.eval()
+        retriever = retriever.to(device)
     
     ## prepare prompts
     tokenizer = AutoTokenizer.from_pretrained(

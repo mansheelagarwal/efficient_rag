@@ -110,6 +110,7 @@ def parse_args():
     )
     parser.add_argument(
         "--save_dir",
+        type=str,
     )
     parser.add_argument(
         "--eval_batch_size",
@@ -127,6 +128,13 @@ def parse_args():
         type=int,
         default=0,
         help="Number of synthetic queries to sample."
+    )
+    
+    # ** STORE DISTRACTOR CONTEXTS ** #
+    parser.add_argument(
+        "--create_distractors",
+        action="store_true",
+        help="If set, generate distractor choices and save to a JSONL file; otherwise, load the JSONL file."
     )
     
     args = parser.parse_args()
@@ -168,14 +176,17 @@ PROMPT_TEMPLATES = {
 def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
 
     prompt = (
-        f"Provide {k} misleading evidence snippets for the question: \"{original_query}\". "
-        "Each snippet should be a short, plain-text Wikipedia-like excerpt that does NOT contain the correct answer. "
-        "Do not include any numbering, bullet points, or special tokens."
+        f"Generate {k} completely unrelated, misleading long contexts for the following question: \"{original_query}\". "
+        "Each snippet should be a plain-text, Wikipedia-like excerpt about a random, generic topic (e.g., history, science, art) that is entirely irrelevant to the question. "
+        "Do not mention any keywords related to the original query (or similar terms). "
+        "Each snippet should be at least 4 SENTENCES LONG and must not reference the question or its subject in any way. "
+        "Do not include numbering, bullet points, extra characters, headers, or any extra labels. "
+        "Do not include numbered lists or any type of ordered lists. "
     )
     
     tokenizer.pad_token = tokenizer.eos_token
     inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(llm.device)
-    output = llm.generate(**inputs, max_new_tokens=200, do_sample=True, temperature=0.9)
+    output = llm.generate(**inputs, max_new_tokens=k*100, do_sample=True, temperature=0.9)
     generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
     
     # split into lines and remove empty lines
@@ -184,15 +195,22 @@ def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
     # post processing
     cleaned_lines = []
     for line in lines:
-        if line.startswith("Provide"):
+        if line.startswith("Generate"):
             continue
-        line = re.sub(r"^Evidence Snippet\s*\d+[:\-]?\s*", "", line)
-        line = re.sub(r"^Snippet\s*\d+[:\-]?\s*", "", line)
+        if line.startswith("Context"):
+            continue
+        if line.startswith("Snippet"):
+            continue
+        if line.startswith("Example"):
+            continue
+        if line.startswith("Question"):
+            continue
+        line = re.sub(r"^Generate\s*\d+[:\-]?\s*", "", line)
+        line = re.sub(r"^Context\s*\d+[:\-]?\s*", "", line)
         line = re.sub(r"^\d+[\.\)]\s*", "", line)
         cleaned_lines.append(line)
     non_empty = [line for line in cleaned_lines if line]
-    
-    # Return exactly k snippets.
+
     return non_empty[:k]
 
 # *** GENERATE SYNTHETIC QUERIES *** #
@@ -454,33 +472,56 @@ def load_dataset(data,use_rag,args):
 if __name__ == "__main__":
 
     args = parse_args()
+    
+    if args.create_distractors:
+        
+        ## prepare dataset
+        dev_data, test_data = load_dataset(
+            args.data,
+            args.use_rag,
+            args,
+        )
+        
+        # *** ADD DISTRACTOR CHOICES *** #
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        temp_llm = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-2-7b-chat-hf",
+            torch_dtype=torch.float16,
+        ).to(device)
+        temp_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+        temp_llm.eval()
 
+        if args.max_test_samples is not None:
+            test_data = test_data[:args.max_test_samples]
+            
+        ext = str(args.max_test_samples) if args.max_test_samples is not None else "all"
+        output_file = os.path.join(args.save_dir, "triviaqa_syn.jsonl")
+        with open(output_file, "w", encoding="utf-8") as f_out:
+            for sample in tqdm(test_data, desc="Generating distractor JSONL"):
+                query = sample["question"]
+                distractor_snippets = generate_distractor_contexts(temp_llm, temp_tokenizer, query, k=5)
+
+                topk_list = []
+                for i, snippet in enumerate(distractor_snippets):
+                    topk_item = {
+                        "pid": None,
+                        "prob": None,
+                        "rank": None,
+                        "score": None,
+                        "text": snippet
+                    }
+                    topk_list.append(topk_item)
+                output_obj = {"query": query, "topk": topk_list}
+                f_out.write(json.dumps(output_obj) + "\n")
+        print(f"Distractor JSONL saved to {output_file}")
+        exit(0) # leave python script
+        
     ## prepare dataset
     dev_data, test_data = load_dataset(
         args.data,
         args.use_rag,
         args,
     )
-        
-    # *** ADD DISTRACTOR CHOICES *** #
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    temp_llm = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-2-7b-chat-hf",
-        torch_dtype=torch.float16,
-    ).to(device)
-    temp_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
-    temp_llm.eval()
-
-    if args.max_test_samples is not None:
-        test_data = test_data[:args.max_test_samples]
-        
-    for sample in tqdm(test_data):
-        original_query = sample["question"]
-        distractors = generate_distractor_contexts(temp_llm, temp_tokenizer, original_query, k=5)
-        sample["background"].extend(distractors)
-        
-    del temp_llm, temp_tokenizer
-    torch.cuda.empty_cache()
 
     ## load retriever and retriever_tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -495,7 +536,7 @@ if __name__ == "__main__":
         tokenizer.pad_token_id = tokenizer.unk_token_id
     elif tokenizer.eos_token:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        
+
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     retrieval_embed_length = 0
     retriever,retriever_tokenizer = None,None

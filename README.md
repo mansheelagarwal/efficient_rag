@@ -1,6 +1,6 @@
 # [INSERT PROJECT TITLE HERE]
 
-1. Generate Distractor Choices
+## 1. Generate Distractor Choices
 
 To save time and storage when setting up the corpus, we generate distractor context for each query. The prompt to generate the context is as shown:
 

@@ -241,7 +241,7 @@ def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
 
     prompt = (
         f"Generate {k} completely unrelated, misleading long contexts for the following question: \"{original_query}\". "
-        "Each snippet should be a plain-text, Wikipedia-like excerpt about a random, generic topic (e.g., history, science, art) that is entirely irrelevant to the question. "
+        "Each snippet should be at least 4 SENTENCES LONG, Wikipedia-like excerpt about a similar topic but is entirely irrelevant to the question. "
         "Do not mention any keywords related to the original query (or similar terms). "
         "Each snippet should be at least 4 SENTENCES LONG and must not reference the question or its subject in any way. "
         "Do not include numbering, bullet points, extra characters, headers, or any extra labels. "
@@ -308,6 +308,8 @@ def generate_synthetic_queries(llm, tokenizer, original_query, k=5):
         if line.startswith("Example"):
             continue
         if line.startswith("Question"):
+            continue
+        if line.startswith("Here"):
             continue
         line = re.sub(r"^Generate\s*\d+[:\-]?\s*", "", line)
         line = re.sub(r"^Context\s*\d+[:\-]?\s*", "", line)
@@ -671,19 +673,20 @@ if __name__ == "__main__":
             test_data = test_data[:args.max_test_samples]
         
         # load model to generate synthetic queries
-        syn_llm = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-2-7b-chat-hf",
-            torch_dtype=torch.float16,
-            device_map='auto',
-        )
-        syn_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
-        syn_llm.eval()
-        for sample in tqdm(test_data, desc="Generating synthetic queries"):
-            original_query = sample["query"]
-            synthetic_queries = generate_synthetic_queries(syn_llm, syn_tokenizer, original_query, k=args.k_samples)
-            sample["synthetic_queries"] = synthetic_queries
-        del syn_llm, syn_tokenizer
-        torch.cuda.empty_cache()
+        if args.k_samples > 0:
+            syn_llm = AutoModelForCausalLM.from_pretrained(
+                "meta-llama/Llama-2-7b-chat-hf",
+                torch_dtype=torch.float16,
+                device_map='auto',
+            )
+            syn_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+            syn_llm.eval()
+            for sample in tqdm(test_data, desc="Generating synthetic queries"):
+                original_query = sample["query"]
+                synthetic_queries = generate_synthetic_queries(syn_llm, syn_tokenizer, original_query, k=args.k_samples)
+                sample["synthetic_queries"] = synthetic_queries
+            del syn_llm, syn_tokenizer
+            torch.cuda.empty_cache()
         
         # load retriever for ensemble reranking
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")

@@ -36,5 +36,5 @@ def jsonl_to_tsv(input_jsonl, output_tsv, include_infobox=False, total_estimate=
 if __name__ == "__main__":
     jsonl_to_tsv(
         "/group/jmearlesgrp/data/Atlas/corpora/wiki/enwiki-dec2021/text-list-100-sec.jsonl",
-        "/group/jmearlesgrp/data/Atlas/corpora/wiki/enwiki-dec2021/text-list-100-sec.tsv"
+        "/group/jmearlesgrp/data/Atlas/corpora/wiki/enwiki-dec2021/collection.tsv"
     )

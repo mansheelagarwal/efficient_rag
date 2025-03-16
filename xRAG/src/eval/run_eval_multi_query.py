@@ -16,6 +16,7 @@ import datasets
 from tqdm import tqdm
 import numpy as np
 import re
+import time
 
 ## own
 from src.model import (
@@ -202,6 +203,8 @@ def get_text_embedding(text, model, tokenizer, max_length=128):
 @torch.no_grad()
 def ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer, max_length=128):
     updated_test_data = []
+    total_unique_documents = 0
+
     for sample in tqdm(test_data, desc="Ensemble re-ranking distractors"):
 
         synthetic_queries = sample.get("synthetic_queries", [])
@@ -228,21 +231,38 @@ def ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer, max_l
             best_distractor = distractors[best_idx]
             votes[best_distractor] = votes.get(best_distractor, 0) + 1
         
+        # Count unique documents voted on
+        unique_documents = len(votes)
+        total_unique_documents += unique_documents
+        
         # select the distractor with the highest vote.
         final_distractor = max(votes.items(), key=lambda x: x[1])[0]
         sample["background"] = [final_distractor]
         updated_test_data.append(sample)
-        
+    
+    # Calculate the average number of unique documents voted on
+    average_unique_documents = total_unique_documents / len(test_data)
+    print(f"Average number of unique documents voted on: {average_unique_documents}")
+    
     return updated_test_data
 
 # *** DISTRACTOR CONTEXT GENERATOR *** #
 @torch.no_grad()
 def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
 
+    # prompt = (
+    #     f"Generate {k} completely unrelated, misleading long contexts for the following question: \"{original_query}\". "
+    #     "Each snippet should be at least 4 SENTENCES LONG, Wikipedia-like excerpt about a similar topic but is entirely irrelevant to the question. "
+    #     "Do not mention any keywords related to the original query (or similar terms). "
+    #     "Each snippet should be at least 4 SENTENCES LONG and must not reference the question or its subject in any way. "
+    #     "Do not include numbering, bullet points, extra characters, headers, or any extra labels. "
+    #     "Do not include numbered lists or any type of ordered lists. "
+    # )
+    
     prompt = (
-        f"Generate {k} completely unrelated, misleading long contexts for the following question: \"{original_query}\". "
-        "Each snippet should be at least 4 SENTENCES LONG, Wikipedia-like excerpt about a similar topic but is entirely irrelevant to the question. "
-        "Do not mention any keywords related to the original query (or similar terms). "
+        f"Generate {k} completely unrelated, misleading long contexts containing very random gibberish. "
+        "Start each snippet with a topic. "
+        "Each snippet should be at least 4 SENTENCES LONG, very random gibberish. "
         "Each snippet should be at least 4 SENTENCES LONG and must not reference the question or its subject in any way. "
         "Do not include numbering, bullet points, extra characters, headers, or any extra labels. "
         "Do not include numbered lists or any type of ordered lists. "
@@ -269,6 +289,15 @@ def generate_distractor_contexts(llm, tokenizer, original_query, k=5):
             continue
         if line.startswith("Question"):
             continue
+        if line.startswith("Here"):
+            continue
+        if line.startswith("Now"):
+            continue
+        
+        # check if the number of samples k is in the line
+        if f"{k} " in line:
+            continue
+        
         line = re.sub(r"^Generate\s*\d+[:\-]?\s*", "", line)
         line = re.sub(r"^Context\s*\d+[:\-]?\s*", "", line)
         line = re.sub(r"^\d+[\.\)]\s*", "", line)
@@ -310,6 +339,8 @@ def generate_synthetic_queries(llm, tokenizer, original_query, k=5):
         if line.startswith("Question"):
             continue
         if line.startswith("Here"):
+            continue
+        if line.startswith("Version"):
             continue
         line = re.sub(r"^Generate\s*\d+[:\-]?\s*", "", line)
         line = re.sub(r"^Context\s*\d+[:\-]?\s*", "", line)
@@ -504,102 +535,102 @@ def load_dataset(data,use_rag,args,use_distractors=False,k_samples=0,max_samples
     test_data = None
     
     # *** USE TRIVIAQA CONTEXT *** #
-    if data.lower() == "triviaqa_topk":
+    # if data.lower() == "triviaqa_topk":
         
-        # load triviaqa from hf
-        dataset = datasets.load_dataset("mandarjoshi/trivia_qa", 'rc', split="validation")
+    #     # load triviaqa from hf
+    #     dataset = datasets.load_dataset("mandarjoshi/trivia_qa", 'rc', split="validation")
         
-        test_data = []
-        print("Loading TriviaQA dataset...")
-        for sample in tqdm(dataset):
+    #     test_data = []
+    #     print("Loading TriviaQA dataset...")
+    #     for sample in tqdm(dataset):
             
-            question = sample['question']
+    #         question = sample['question']
             
-            answer = ""
-            if "answer" in sample and isinstance(sample["answer"], dict):
-                answer = sample["answer"].get("value", "")
+    #         answer = ""
+    #         if "answer" in sample and isinstance(sample["answer"], dict):
+    #             answer = sample["answer"].get("value", "")
                 
-            search_results = sample.get("search_results", {})
-            search_contexts = search_results.get("search_context", [])
+    #         search_results = sample.get("search_results", {})
+    #         search_contexts = search_results.get("search_context", [])
             
-            if not isinstance(search_contexts, list):
-                search_contexts = [search_contexts]
+    #         if not isinstance(search_contexts, list):
+    #             search_contexts = [search_contexts]
                 
-            background = [ctx for ctx in search_contexts if isinstance(ctx, str) and ctx.strip() != ""]
+    #         background = [ctx for ctx in search_contexts if isinstance(ctx, str) and ctx.strip() != ""]
             
-            test_data.append({
-                "question": question,
-                "answer": answer,
-                "background": background
-            })
+    #         test_data.append({
+    #             "question": question,
+    #             "answer": answer,
+    #             "background": background
+    #         })
 
+    # else:
+        
+    # fallback: load from JSONL file as before.
+    if use_distractors:
+        test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/triviaqa_syn.jsonl"
+        
+        if os.path.isfile(test_retrieval_path):
+            test_data = get_jsonl(test_retrieval_path)
+
+        if use_rag:
+            test_retrieval = get_jsonl(test_retrieval_path)
+            assert len(test_retrieval) == len(test_data), "Mismatch in retrieval and test data length"
+
+            # Include all distractors as background context
+            for idx in range(len(test_data)):
+                test_data[idx]['background'] = [entry['text'] for entry in test_retrieval[idx]['topk']]
+
+            if args.tf_idf_topk > 0:
+                assert args.use_rag, "TF-IDF filtering requires RAG mode"
+                
+                # Extract documents for TF-IDF keyword extraction
+                documents = [" ".join(x['background']) for x in test_data]  
+                keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
+                
+                for idx in range(len(test_data)):
+                    test_data[idx]['background'] = [keywords[idx]]
+
+            if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+                for idx in range(len(test_data)):
+                    test_data[idx]['background'] = ["passage: " + text for text in test_data[idx]['background']]
+    
     else:
         
-        # fallback: load from JSONL file as before.
-        if use_distractors:
-            test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/triviaqa_syn.jsonl"
-            
-            if os.path.isfile(test_retrieval_path):
-                test_data = get_jsonl(test_retrieval_path)
-
-            if use_rag:
-                test_retrieval = get_jsonl(test_retrieval_path)
-                assert len(test_retrieval) == len(test_data), "Mismatch in retrieval and test data length"
-
-                # Include all distractors as background context
-                for idx in range(len(test_data)):
-                    test_data[idx]['background'] = [entry['text'] for entry in test_retrieval[idx]['topk']]
-
-                if args.tf_idf_topk > 0:
-                    assert args.use_rag, "TF-IDF filtering requires RAG mode"
-                    
-                    # Extract documents for TF-IDF keyword extraction
-                    documents = [" ".join(x['background']) for x in test_data]  
-                    keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
-                    
-                    for idx in range(len(test_data)):
-                        test_data[idx]['background'] = [keywords[idx]]
-
-                if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
-                    for idx in range(len(test_data)):
-                        test_data[idx]['background'] = ["passage: " + text for text in test_data[idx]['background']]
-        
+        test_path = f"../../data/eval/{data}/test.jsonl"
+        if k_samples > 0:
+            test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/triviaqa_syn_ensemble_{k_samples}.jsonl"
         else:
-            
-            test_path = f"../../data/eval/{data}/test.jsonl"
-            if k_samples > 0:
-                test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/triviaqa_syn_ensemble_{k_samples}.jsonl"
-            else:
-                test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/test.jsonl"
-            
-            if os.path.isfile(test_path):
-                test_data = get_jsonl(test_path)
+            test_retrieval_path = f"../../data/eval/{data}/retrieval/colbertv2/test.jsonl"
+        
+        if os.path.isfile(test_path):
+            test_data = get_jsonl(test_path)
 
-            if use_rag:
-                
-                test_retrieval = get_jsonl(test_retrieval_path)
-                
-                if max_samples is not None:
-                    test_data = test_data[:max_samples]
-                    test_retrieval = test_retrieval[:max_samples]
-                assert len(test_retrieval) == len(test_data)
-                
+        if use_rag:
+            
+            test_retrieval = get_jsonl(test_retrieval_path)
+            
+            if max_samples is not None:
+                test_data = test_data[:max_samples]
+                test_retrieval = test_retrieval[:max_samples]
+            assert len(test_retrieval) == len(test_data)
+            
+            for idx in range(len(test_data)):
+                if k_samples > 0:
+                    test_data[idx]['background'] = [test_retrieval[idx]['topk'] for rank in args.retrieval_topk]
+                else:
+                    test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
+
+            if args.tf_idf_topk > 0:
+                assert args.use_rag
+                documents = [x['background'][0] for x in test_data]
+                keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
                 for idx in range(len(test_data)):
-                    if k_samples > 0:
-                        test_data[idx]['background'] = [test_retrieval[idx]['topk'] for rank in args.retrieval_topk]
-                    else:
-                        test_data[idx]['background'] = [test_retrieval[idx]['topk'][rank]['text'] for rank in args.retrieval_topk]
+                    test_data[idx]['background'] = [keywords[idx]]
 
-                if args.tf_idf_topk > 0:
-                    assert args.use_rag
-                    documents = [x['background'][0] for x in test_data]
-                    keywords = keyword_extraction_with_tfidf(documents, topk=args.tf_idf_topk)
-                    for idx in range(len(test_data)):
-                        test_data[idx]['background'] = [keywords[idx]]
-
-                if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
-                    for idx in range(len(test_data)):
-                        test_data[idx]['background'] = ["passage: " + x for x in test_data[idx]['background']]
+            if args.retriever_name_or_path is not None and args.retriever_name_or_path.lower() == "intfloat/e5-large-v2":
+                for idx in range(len(test_data)):
+                    test_data[idx]['background'] = ["passage: " + x for x in test_data[idx]['background']]
 
     return dev_data, test_data
 
@@ -634,7 +665,7 @@ if __name__ == "__main__":
             for sample in tqdm(test_data, desc="Generating distractor JSONL"):
                 query = sample["question"]
                 orig_background = sample.get("background", [])
-                distractor_snippets = generate_distractor_contexts(temp_llm, temp_tokenizer, query, k=5)
+                distractor_snippets = generate_distractor_contexts(temp_llm, temp_tokenizer, query, k=10)
                 
                 topk_list = []
                 for bg in orig_background:
@@ -662,6 +693,8 @@ if __name__ == "__main__":
     
     # ** LOAD MODEL FOR SYNTHETIC QUERY GENERATION ** #
     if args.ensemble_rerank:
+        all_times = []
+        
         # load dataset with distractor choices
         dev_data, test_data = load_dataset(
             args.data,
@@ -702,7 +735,10 @@ if __name__ == "__main__":
             retriever = retriever.to(device)
         
         # (This function uses the precomputed sample["synthetic_queries"] and the distractor choices in sample["background"])
-        test_data = ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer)
+        start_time = time.time()
+        test_data = ensemble_rerank_distractors(test_data, retriever, retriever_tokenizer, max_length=1024) # TODO: time this
+        end_time = time.time()
+        all_times.append(end_time - start_time)
         
         # save the ensemble JSONL file
         ensemble_output_file = os.path.join(args.save_dir, f"triviaqa_syn_ensemble_{args.k_samples}.jsonl")
@@ -715,6 +751,9 @@ if __name__ == "__main__":
                 }
                 f_out.write(json.dumps(output_obj) + "\n")
         print(f"Ensemble JSONL saved to {ensemble_output_file}")
+        
+        # print average time
+        print(f"Average time for ensemble reranking: {np.mean(all_times):.2f} seconds")
         exit(0)
         
     ## load dataset

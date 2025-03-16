@@ -141,8 +141,6 @@ def parse_args():
 
     return args
 
-
-
 QA_PROMPT = "Question: {question}?\n"
 FECT_CHECKING_PROPMT = "Claim: {question}\n"
 BACKGROUND_PROMPT_TEMPLATE = "Background: {background}\n\n"

@@ -118,7 +118,6 @@ def parse_args():
         "--chat_format",
         default='mistral',
     )
-    
     args = parser.parse_args()
 
     ## post-process
@@ -141,8 +140,6 @@ def parse_args():
         args.use_rag = True
 
     return args
-
-
 
 QA_PROMPT = "Question: {question}?\n"
 FECT_CHECKING_PROPMT = "Claim: {question}\n"

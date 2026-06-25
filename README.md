@@ -1,5 +1,10 @@
 # [INSERT PROJECT TITLE HERE]
 
+## What I did :
+1. Improved answer accuracy by increasing Exact Match from 0.51 to 0.53 through the generation of up to 20 synthetic queries per question.
+2. Enhanced retrieval robustness by using ensemble reranking across multi-query results to consistently identify the most relevant documents.
+3. Reduced inference latency from approximately 43.2 seconds to 15.6 seconds by aggregating multi-document evidence before single-token compression.
+
 ## 1. Generate Distractor Choices
 
 To save time and storage when setting up the corpus, we generate distractor context for each query. The prompt to generate the context is as shown:

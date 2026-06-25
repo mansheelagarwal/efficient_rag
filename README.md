@@ -1,4 +1,4 @@
-# [INSERT PROJECT TITLE HERE]
+# Improving Single Token Compression for Retrieval-Augmented Generation
 
 ## What I did :
 1. Improved answer accuracy by increasing Exact Match from 0.51 to 0.53 through the generation of up to 20 synthetic queries per question.
